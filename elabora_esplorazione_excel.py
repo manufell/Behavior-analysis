@@ -74,7 +74,7 @@ def carica_dati(path):
     return pd.read_excel(path)
 
 
-OBS_ID_NUM_RE = re.compile(r"c(\d+)", re.IGNORECASE)
+OBS_ID_NUM_RE = re.compile(r"(\d+)", re.IGNORECASE)
 
 
 def estrai_fase(observation_id):
@@ -92,6 +92,28 @@ def estrai_numero_observation_id(observation_id):
     testo = str(observation_id)
     match = OBS_ID_NUM_RE.search(testo)
     return int(match.group(1)) if match else float("inf")
+
+
+def calcola_tempo_a_soglia(df_sessione, soglia=SOGLIA_SECONDI):
+    """Restituisce il tempo di sessione in cui si raggiungono i 10s di
+    esplorazione cumulata. Se la sessione non raggiunge mai la soglia,
+    restituisce 600s."""
+    explore_df = df_sessione.loc[
+        df_sessione[BEHAVIOR_COL_NAME].astype(str).str.startswith(PREFISSO_BEHAVIOR),
+        [BEHAVIOR_COL_NAME, START_COL_NAME, STOP_COL_NAME, DURATION_COL_NAME]
+    ].copy()
+
+    if explore_df.empty:
+        return 600.0
+
+    explore_df = explore_df.sort_values(START_COL_NAME)
+    cumulative = 0.0
+    for _, row in explore_df.iterrows():
+        cumulative += float(row[DURATION_COL_NAME])
+        if cumulative >= soglia:
+            return float(row[STOP_COL_NAME])
+
+    return 600.0
 
 
 def get_first10s_subset(df_sessione):
@@ -227,7 +249,7 @@ def riassumi_sessione(observation_id, df_sessione, behavior_types):
     latenza = start.min() if len(start) else float("nan")
 
     # Tempo di sessione necessario a raggiungere i 10s di esplorazione cumulata
-    tempo_a_soglia = stop.iloc[-1] if len(stop) else float("nan")
+    tempo_a_soglia = calcola_tempo_a_soglia(df_sessione)
 
     # Nelle sessioni 'training' non ha senso Explore_N (niente oggetto novel):
     # svuotiamo le sue colonne e il DI classico che lo usa.
@@ -244,10 +266,18 @@ def riassumi_sessione(observation_id, df_sessione, behavior_types):
             if "Explore_F2" in chiave:
                 per_tipo_colonne[chiave] = float("nan")
 
+    subset_for_mean = subset.copy()
+    mean_bout_all_events_session = (
+        subset_for_mean[DURATION_COL_NAME].mean()
+        if not subset_for_mean.empty and subset_for_mean[DURATION_COL_NAME].notna().any()
+        else float("nan")
+    )
+
     risultato = {
         "Observation id": observation_id,
         "Phase": fase,
         "Discrimination Index (first 10s)": DI_first10s,
+        "Mean bout duration first 10s (s)": mean_bout_all_events_session,
     }
 
     bin_metrics = calcola_metriche_bin(df_sessione, fase)
@@ -266,6 +296,27 @@ def riassumi_sessione(observation_id, df_sessione, behavior_types):
     risultato.update(per_tipo_colonne)
     risultato.update(time_bin_metrics)
     return risultato
+
+
+def salva_excel_sicuro(df, path, descrizione):
+    """Scrive un DataFrame in Excel, usando un nome alternativo se il file
+    è già aperto/lockato da Excel."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    try:
+        df.to_excel(path, index=False)
+        print(f"[OK] {descrizione} -> {path}")
+    except PermissionError as exc:
+        stem, ext = os.path.splitext(path)
+        fallback_path = f"{stem}_generated{ext}"
+        counter = 1
+        while os.path.exists(fallback_path):
+            fallback_path = f"{stem}_generated_{counter}{ext}"
+            counter += 1
+        try:
+            df.to_excel(fallback_path, index=False)
+            print(f"[WARN] Could not write to {path} because it is open/locked. Wrote to {fallback_path} instead.")
+        except PermissionError as exc2:
+            print(f"[WARN] Could not write to {path} or {fallback_path}: {exc2}. Close the Excel file and rerun.")
 
 
 def salva_file_con_formule(df_ordinato, output_folder):
@@ -312,9 +363,42 @@ def salva_file_con_formule(df_ordinato, output_folder):
 
     os.makedirs(output_folder, exist_ok=True)
     path_out = os.path.join(output_folder, OUTPUT_FORMULAS)
-    wb.save(path_out)
-    print(f"[OK] Formulas added (per session) -> {path_out}")
-    print("     (open the file in Excel: the formulas are calculated automatically)")
+    try:
+        wb.save(path_out)
+        print(f"[OK] Formulas added (per session) -> {path_out}")
+        print("     (open the file in Excel: the formulas are calculated automatically)")
+    except PermissionError as exc:
+        stem, ext = os.path.splitext(path_out)
+        fallback_path = f"{stem}_generated{ext}"
+        counter = 1
+        while os.path.exists(fallback_path):
+            fallback_path = f"{stem}_generated_{counter}{ext}"
+            counter += 1
+        try:
+            wb.save(fallback_path)
+            print(f"[WARN] Could not write to {path_out} because it is open/locked. Wrote to {fallback_path} instead.")
+        except PermissionError as exc2:
+            print(f"[WARN] Could not write to {path_out} or {fallback_path}: {exc2}. Close the Excel file and rerun.")
+
+
+def ordina_df_per_observation_id(df, conservare_phase=False):
+    """Ordina le sessioni in modo stabile e numerico per Observation id."""
+    df_ordinato = df.copy()
+    df_ordinato["Phase"] = df_ordinato[OBS_ID_COL_NAME].apply(estrai_fase)
+    df_ordinato["_phase_order"] = df_ordinato["Phase"].map({"training": 0, "test": 1, "non specified": 2}).fillna(99)
+    df_ordinato["_obs_number"] = df_ordinato[OBS_ID_COL_NAME].apply(estrai_numero_observation_id)
+    df_ordinato["_obs_text"] = df_ordinato[OBS_ID_COL_NAME].astype(str)
+
+    sort_columns = ["_phase_order", "_obs_number", "_obs_text"]
+    if START_COL_NAME in df_ordinato.columns:
+        sort_columns.append(START_COL_NAME)
+
+    df_ordinato = df_ordinato.sort_values(sort_columns).reset_index(drop=True)
+
+    colonne_da_rimuovere = ["_phase_order", "_obs_number", "_obs_text"]
+    if not conservare_phase:
+        colonne_da_rimuovere.append("Phase")
+    return df_ordinato.drop(columns=colonne_da_rimuovere)
 
 
 def main():
@@ -327,13 +411,7 @@ def main():
         print(f"Colonna '{OBS_ID_COL_NAME}' non trovata nel file.")
         return
 
-    df_ordinato = df.copy()
-    df_ordinato["Phase"] = df_ordinato[OBS_ID_COL_NAME].apply(estrai_fase)
-    df_ordinato["_phase_order"] = df_ordinato["Phase"].map({"training": 0, "test": 1, "non specified": 2}).fillna(99)
-    df_ordinato["_obs_number"] = df_ordinato[OBS_ID_COL_NAME].apply(estrai_numero_observation_id)
-    df_ordinato = df_ordinato.sort_values(
-        ["_phase_order", "_obs_number", OBS_ID_COL_NAME, START_COL_NAME]
-    ).drop(columns=["Phase", "_phase_order", "_obs_number"]).reset_index(drop=True)
+    df_ordinato = ordina_df_per_observation_id(df, conservare_phase=False)
 
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -362,25 +440,15 @@ def main():
         riepilogo.append(riassumi_sessione(obs_id, gruppo, behavior_types))
 
     df_primi10s = pd.concat(tutti_primi10s, ignore_index=True)
-    df_primi10s["_phase_order"] = df_primi10s["Phase"].map({"training": 0, "test": 1, "non specified": 2}).fillna(99)
-    df_primi10s["_obs_number"] = df_primi10s[OBS_ID_COL_NAME].apply(estrai_numero_observation_id)
-    df_primi10s = df_primi10s.sort_values(
-        ["_phase_order", "_obs_number", OBS_ID_COL_NAME, START_COL_NAME]
-    ).drop(columns=["_phase_order", "_obs_number"]).reset_index(drop=True)
+    df_primi10s = ordina_df_per_observation_id(df_primi10s, conservare_phase=True)
     path_primi10s = os.path.join(OUTPUT_FOLDER, OUTPUT_FIRST10S)
-    df_primi10s.to_excel(path_primi10s, index=False)
-    print(f"[OK] Events within {SOGLIA_SECONDI}s for all sessions -> {path_primi10s}")
+    salva_excel_sicuro(df_primi10s, path_primi10s, f"Events within {SOGLIA_SECONDI}s for all sessions")
 
     # 3) Riepilogo con una riga per sessione (Observation id)
     df_riepilogo = pd.DataFrame(riepilogo)
-    df_riepilogo["_phase_order"] = df_riepilogo["Phase"].map({"training": 0, "test": 1, "non specified": 2}).fillna(99)
-    df_riepilogo["_obs_number"] = df_riepilogo["Observation id"].apply(estrai_numero_observation_id)
-    df_riepilogo = df_riepilogo.sort_values(
-        ["_phase_order", "_obs_number", "Observation id"]
-    ).drop(columns=["_phase_order", "_obs_number"]).reset_index(drop=True)
+    df_riepilogo = ordina_df_per_observation_id(df_riepilogo, conservare_phase=True)
     path_riepilogo = os.path.join(OUTPUT_FOLDER, OUTPUT_SUMMARY)
-    df_riepilogo.to_excel(path_riepilogo, index=False)
-    print(f"[OK] Session summary ({len(df_riepilogo)} sessions) -> {path_riepilogo}")
+    salva_excel_sicuro(df_riepilogo, path_riepilogo, f"Session summary ({len(df_riepilogo)} sessions)")
 
 
 if __name__ == "__main__":
