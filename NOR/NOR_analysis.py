@@ -33,7 +33,7 @@ Output (in the OUTPUT_FOLDER):
       Index (N vs F for test, F2 vs F for training).
 
 Usage:
-    python elabora_esplorazione_excel.py
+    python NOR_analysis.py
 
 Requirements: pip install pandas openpyxl
 """
@@ -47,8 +47,8 @@ from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 
 # ------------------- PARAMETRI MODIFICABILI -------------------
-INPUT_FILE = "full data.xlsx"   # single file with ALL data (.xlsx or .csv)
-OUTPUT_FOLDER = "output"
+INPUT_FILE = "NOR/full data.xlsx"   # single file with ALL data (.xlsx or .csv)
+OUTPUT_FOLDER = "NOR/output"
 OUTPUT_FORMULAS = "data_complete_formulas.xlsx"
 OUTPUT_FIRST10S = "first10s_events.xlsx"
 OUTPUT_SUMMARY = "session_summary.xlsx"
